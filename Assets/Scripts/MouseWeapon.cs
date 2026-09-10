@@ -26,7 +26,7 @@ namespace WeaponExperiment
     /// classification, no slash/stab methods. NOT here: rigidbodies, mass/inertia,
     /// balance/force transfer, springs, arms/IK, inventory, damage, combos, animation.
     /// </summary>
-    public class MouseWeapon : MonoBehaviour
+    public class MouseWeapon : MonoBehaviour, IWeapon, IWeaponRecoil
     {
         [Header("References")]
         [Tooltip("Weapon origin A. Empty transform at the player. Auto-found as child \"WeaponPivot\".")]
@@ -100,6 +100,20 @@ namespace WeaponExperiment
         [Tooltip("Recent window (s) over which the ACTUAL weapon facing's angular span is measured.")]
         [SerializeField] private float weaponSpanWindow = 0.25f;
 
+        [Header("Contact solver (weapon vs shield)")]
+        [SerializeField] private WeaponContactConfig contact = new WeaponContactConfig();
+
+        [Header("Engage (LMB) + Side Ready")]
+        [Tooltip("Provides the Player facing + LMB engage flag. Auto: GetComponent. If missing, the " +
+                 "weapon is always engaged (old always-on behaviour).")]
+        [SerializeField] private PlayerFacing playerFacing;
+        [Tooltip("Degrees the resting weapon is held off the Player facing (a side carry, not an aim).")]
+        [SerializeField] private float readyYawOffset = -50f;
+        [Tooltip("Reach the weapon pulls in to while in Side Ready (compact, tip not far in front).")]
+        [SerializeField] private float readyReach = 0.9f;
+        [Tooltip("Seconds to ease into / out of the Side Ready pose.")]
+        [SerializeField] private float readySmoothTime = 0.15f;
+
         [Header("Debug")]
         [Tooltip("On-screen readout of mLen / targetReach / _reach / yaw error / stowed / swing load.")]
         [SerializeField] private bool showDebug = true;
@@ -148,6 +162,11 @@ namespace WeaponExperiment
         private Vector3 _tipVelDir = Vector3.forward;
         private bool _suspended;             // OverSwing consequence: all control blocked, weapon forced to a safe stow
 
+        private WeaponContactSolver _solver; // resolves the tip vs foreign shields before the pose commits
+        private Object _selfOwner;
+        private bool _engaged;               // LMB held -> direct mouse control; else Side Ready
+        private bool _prevEngaged;
+
         private float _dbgMLen, _dbgTargetReach, _dbgYawErr; // read-only snapshot for the debug HUD
 
         private void Awake()
@@ -166,6 +185,11 @@ namespace WeaponExperiment
             _prevRawBearing = _aimYaw;
             _prevTipOffset = _aimDir * _reach;
             _tipVelDir = _aimDir;
+            _selfOwner = GetComponentInParent<DamageTarget>();
+            _solver = new WeaponContactSolver(contact);
+            _solver.Reset(_aimYaw, _reach, (pivot != null ? pivot.position : transform.position));
+            if (playerFacing == null) playerFacing = GetComponent<PlayerFacing>();
+            _prevEngaged = _engaged = playerFacing == null;
 
             if (club != null)
             {
@@ -207,6 +231,36 @@ namespace WeaponExperiment
             float bearing = Mathf.Atan2(m.x, m.z) * Mathf.Rad2Deg;
             float k = 1f - Mathf.Exp(-velInfluence * dt); // this frame's blend of motion input into carried velocity
             float winDecay = Mathf.Exp(-dt / Mathf.Max(overswingWindow, 1e-4f));
+            float committedYawPrev = _aimYaw;
+
+            // --- LMB gate: engaged = direct mouse weapon control; otherwise Side Ready. ---
+            _engaged = playerFacing == null || playerFacing.WeaponEngaged;
+            if (_engaged != _prevEngaged)
+            {
+                if (_engaged)
+                {
+                    // ENGAGE: hand the mouse back to the weapon. It rises from Side Ready toward
+                    // the cursor via the normal ACTIVE branch (low mouse speed -> no fake OverSwing).
+                    _stowed = false;
+                    _targetYaw = bearing;
+                    _aimYawVel = 0f;
+                    _reachVel = 0f;
+                    _mouseVel = Vector3.zero;
+                    _mousePrimed = false;
+                    ClearSwingHistory(bearing);
+                    _solver.Reset(_aimYaw, _reach, origin);
+                }
+                else
+                {
+                    // DISENGAGE: drop carried motion; the Side Ready branch eases the weapon back.
+                    _aimYawVel = 0f;
+                    _reachVel = 0f;
+                    _mouseVel = Vector3.zero;
+                    _mousePrimed = false;
+                    ClearSwingHistory(bearing);
+                }
+                _prevEngaged = _engaged;
+            }
 
             if (_suspended)
             {
@@ -220,6 +274,31 @@ namespace WeaponExperiment
                 _aimYaw = Mathf.SmoothDampAngle(_aimYaw, _targetYaw, ref _aimYawVel, stowSmoothTime, Mathf.Infinity, dt);
                 _aimDir = YawDir(_aimYaw);
                 _reach = Mathf.SmoothDamp(_reach, minReach, ref _reachVel, stowSmoothTime, Mathf.Infinity, dt);
+            }
+            else if (_solver.InImpactResponse)
+            {
+                // ===== IMPACT RESPONSE: a real shield impact owns the yaw for a brief window.
+                //       Mouse ignored; _solver.Step (below) drives _aimYaw. A mere resting
+                //       contact does NOT land here - the mouse keeps control and Step just
+                //       clamps the yaw so the shaft can slide along the shield without going
+                //       through it.
+                _mouseVel = Vector3.zero;
+                _aimYawVel = 0f;
+                _reachVel = 0f;
+                ClearSwingHistory(bearing);
+            }
+            else if (!_engaged)
+            {
+                // ===== SIDE READY: LMB up. Mouse does NOT drive the weapon (it drives the
+                //       Player facing instead). Hold the weapon at a compact side pose;
+                //       no swing / no WeaponSpeed as attack / no OverSwing accumulation.
+                _mouseVel = Vector3.zero;
+                _stowed = false;
+                ClearSwingHistory(bearing);
+                float readyYaw = (playerFacing != null ? playerFacing.FacingYaw : _aimYaw) + readyYawOffset;
+                _aimYaw = Mathf.SmoothDampAngle(_aimYaw, readyYaw, ref _aimYawVel, readySmoothTime, Mathf.Infinity, dt);
+                _aimDir = YawDir(_aimYaw);
+                _reach = Mathf.SmoothDamp(_reach, readyReach, ref _reachVel, readySmoothTime, Mathf.Infinity, dt);
             }
             else
             {
@@ -354,6 +433,14 @@ namespace WeaponExperiment
                 }
             }
 
+            // --- Contact solve: clamp _aimYaw so the tip never penetrates a foreign shield;
+            //     on contact an incoming-velocity response owns the yaw for a brief window.
+            //     _tipVel here still holds the PREVIOUS frame's velocity = the incoming velocity.
+            _aimYaw = _solver.Step(_aimYaw, committedYawPrev, _reach, origin, _tipVel, _selfOwner, dt);
+            _aimDir = YawDir(_aimYaw);
+            if (_solver.JustEnded)
+                _mousePrimed = false; // resync the cursor baseline so control resumes without a spike
+
             // --- Weapon tip motion in world space, measured RELATIVE TO ORIGIN so that
             //     walking is excluded - this is the actual direction the weapon head is
             //     sweeping (yaw follow-through included), used as the Stagger drag direction.
@@ -390,7 +477,7 @@ namespace WeaponExperiment
         /// <summary>speedFactor * (AngularSpan / overswingAngleRef). >= overswingThreshold => OverSwingActive.</summary>
         public float SwingLoad => _swingLoad;
         /// <summary>True only while Active (drawn, not suspended) and the swing load is over threshold.</summary>
-        public bool OverSwingActive => !_stowed && !_suspended && _swingLoad >= overswingThreshold;
+        public bool OverSwingActive => _engaged && !_stowed && !_suspended && _swingLoad >= overswingThreshold;
         /// <summary>Current weapon facing (unit, XZ).</summary>
         public Vector3 AimDir => _aimDir;
         /// <summary>Actual direction the weapon tip is moving (unit, XZ, relative to the player).</summary>
@@ -401,13 +488,26 @@ namespace WeaponExperiment
         /// <summary>Actual weapon tip speed (m/s), measured relative to the player - Run / walking
         /// is excluded because _tipVel differentiates the origin-relative tip offset.</summary>
         public float WeaponSpeed => _tipVel.magnitude;
+        /// <summary>Actual weapon tip velocity vector (m/s, player-relative). Same source as WeaponSpeed.</summary>
+        public Vector3 WeaponTipVelocity => _tipVel;
         /// <summary>Widest arc the ACTUAL (lagged/inertial) weapon facing swept in the recent
         /// weaponSpanWindow (deg). NOT the mouse AngularSpan.</summary>
         public float WeaponSwingSpan => _weaponSpan;
-        /// <summary>Weapon may deal damage: drawn (not stowed) and not Stumble/Fall-suspended.</summary>
-        public bool WeaponCanHit => !_stowed && !_suspended;
+        /// <summary>Weapon may deal damage: LMB-engaged, drawn, not Stumble/Fall-suspended, not in an Impact response.</summary>
+        public bool WeaponCanHit => _engaged && !_stowed && !_suspended && !(_solver != null && _solver.InImpactResponse);
         /// <summary>World position of the weapon tip (business end).</summary>
         public Vector3 WeaponTipWorld => (pivot != null ? pivot.position : transform.position) + _aimDir * _reach;
+
+        // ---- IWeaponRecoil (contact response) ----
+        // True ONLY during a real Impact response window - never for a resting/sliding contact.
+        public bool IsRecoiling => _solver != null && _solver.InImpactResponse;
+
+        public void ApplyRecoil(Vector3 worldRecoilVelocity, float interruptSeconds)
+        {
+            _aimYawVel = 0f;
+            _reachVel = 0f;
+            _solver?.InjectResponse(worldRecoilVelocity, interruptSeconds, _reach, _aimYaw);
+        }
 
         /// <summary>Stumble / Fall: block all control and force the weapon to a safe stow.</summary>
         public void SetSuspended(bool value) => _suspended = value;
@@ -428,6 +528,7 @@ namespace WeaponExperiment
             _prevTipOffset = _aimDir * _reach;
             _mousePrimed = false;        // re-primes _prevMouseOffset from the live cursor next frame
             ClearSwingHistory(_aimYaw);
+            _solver?.Reset(_aimYaw, _reach, pivot != null ? pivot.position : transform.position);
         }
 
         /// <summary>Wipe the OverSwing angular history (debug travel + span ring buffer), re-based at

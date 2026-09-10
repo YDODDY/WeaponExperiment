@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 namespace WeaponExperiment
@@ -29,10 +30,16 @@ namespace WeaponExperiment
         private float _hp;
         private DamageInfo _lastHit;
         private bool _hasHit;
+        private bool _deathAnnounced;
 
         public float HP => _hp;
         public float MaxHP => maxHP;
         public bool IsDead => _hp <= 0f;
+
+        /// <summary>Fired for every hit that removed HP (amount &gt; 0). Used by e.g. CombatEntity to turn hostile.</summary>
+        public event Action<DamageInfo> Damaged;
+        /// <summary>Fired once, the moment HP first reaches 0. Player / Entity both hang death handling off this.</summary>
+        public event Action Died;
 
         private void Awake() => _hp = maxHP;
 
@@ -46,6 +53,14 @@ namespace WeaponExperiment
                 $"[DamageTarget:{name}] -{info.amount:F1}  " +
                 $"(weaponSpeed {info.weaponSpeed:F1} m/s, swingSpan {info.weaponSwingSpan:F0} deg)  " +
                 $"->  HP {_hp:F0}/{maxHP:F0}{(IsDead ? "   *** DEAD ***" : "")}", this);
+
+            if (info.amount > 0f)
+                Damaged?.Invoke(info);
+            if (IsDead && !_deathAnnounced)
+            {
+                _deathAnnounced = true;
+                Died?.Invoke();
+            }
         }
 
         private void OnGUI()
