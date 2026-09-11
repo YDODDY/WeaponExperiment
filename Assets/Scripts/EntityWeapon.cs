@@ -109,12 +109,10 @@ namespace WeaponExperiment
             _solver = new WeaponContactSolver(contact);
             _solver.Reset(_aimYaw, _curReach, (pivot != null ? pivot.position : transform.position));
 
-            if (club != null)
-            {
-                club.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                Vector3 s = club.localScale;
-                club.localScale = new Vector3(s.x, clubLength * 0.5f, s.z);
-            }
+            // NOTE: `club` is the PHYSICAL reach representation only (localPosition.z placed at
+            // _curReach every frame below) - rotation/scale stay identity. Mesh alignment is
+            // scene-authored on club's "VisualRoot/Placeholder" child, decoupled from this
+            // gameplay-owned transform so an external weapon mesh never touches it.
         }
 
         /// <summary>Begin one swing whose strike sweeps across <paramref name="centreYawDeg"/>

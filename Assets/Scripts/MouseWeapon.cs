@@ -191,14 +191,11 @@ namespace WeaponExperiment
             if (playerFacing == null) playerFacing = GetComponent<PlayerFacing>();
             _prevEngaged = _engaged = playerFacing == null;
 
-            if (club != null)
-            {
-                // Lay the cylinder (2 units tall on local Y) along the pivot's local +Z,
-                // and bake the fixed length into its scale ONCE. Nothing after this touches scale.
-                club.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                Vector3 s = club.localScale;
-                club.localScale = new Vector3(s.x, clubLength * 0.5f, s.z);
-            }
+            // NOTE: `club` is the PHYSICAL reach representation only (its localPosition.z is
+            // written every frame below to place the tip at _reach) - its rotation/scale stay
+            // identity. Any mesh alignment (e.g. laying a cylinder along +Z, stretching it to
+            // clubLength) is scene-authored on club's own "VisualRoot/Placeholder" child instead,
+            // so swapping in an external weapon mesh never touches this gameplay-owned transform.
         }
 
         private void LateUpdate()
@@ -461,6 +458,11 @@ namespace WeaponExperiment
             {
                 Vector3 drawnPos = new Vector3(0f, 0f, _reach - clubLength * 0.5f); // tip sits at B
                 club.localPosition = Vector3.Lerp(drawnPos, stowClubLocalPos, _stowBlend);
+                // NOTE: unlike EntityWeapon (which never touches club.localRotation - EntityClub
+                // has no stow pose), this IS the cylinder-alignment + stow-tilt blend, written every
+                // frame. It doubles as "visual alignment" for the Player weapon, so club's
+                // "VisualRoot/Placeholder" child must stay at IDENTITY rotation - baking any
+                // alignment there too would compose on top of this and rotate the mesh twice.
                 club.localRotation = Quaternion.Slerp(
                     Quaternion.Euler(90f, 0f, 0f), Quaternion.Euler(stowClubLocalEuler), _stowBlend);
             }
